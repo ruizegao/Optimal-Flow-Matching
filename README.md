@@ -37,6 +37,37 @@ The notebooks for <u>ALAE experiment</u>:
 
 Before running ALAE notebooks, have a look at the `./ALAE` folder (e.g. some packages need to be installed).
 
+## Running the `gau_v2cpf` experiments
+
+Notebook: `ofm_notebooks/toy8gau_v2cpf.ipynb` (Gaussian -> Eight Gaussians, `ICNN2CPF` model).
+
+**Setup.** There is no `requirements.txt`; install the packages the notebook imports (a CUDA GPU is assumed by default):
+
+```bash
+pip install torch numpy pandas matplotlib tqdm jupyter
+```
+
+**Run.** Start Jupyter *from inside `ofm_notebooks/`* (the notebook does `sys.path.append('..')` to import `ofmsrc`):
+
+```bash
+cd ofm_notebooks
+jupyter notebook toy8gau_v2cpf.ipynb
+```
+
+Then run all cells. The first cell holds the parameters:
+
+| Parameter | Meaning |
+|---|---|
+| `DEVICE` | `'cuda:0'` by default; set `'cpu'` if you have no GPU (slower) |
+| `INV_MAX_ITER` | cap on outer L-BFGS steps of the inner solve (the saved run uses `10`) |
+| `MAX_ITER` | total number of training iterations (`30000`) |
+
+**Outputs.** Results go to `ofm_notebooks/gau_v2cpf_cap<INV_MAX_ITER>/`: `samples.png`, `loss.png`, `profile.png`/`profile.csv` (timing per iteration), `conv.png`/`conv.npz` (inner-solver convergence), model weights (`model*.pth`) and `ckpt.pt`.
+
+**Resuming.** Training saves a checkpoint (`ckpt.pt`) every `CKPT_EVERY=500` iterations. Re-running the notebook resumes from it; raise `MAX_ITER` to train longer. Delete the output folder to start from scratch.
+
+**Included results.** `ofm_notebooks/gau_v2cpf_cap10/` holds the finished run with `INV_MAX_ITER=10`, so you can look at the plots without retraining. `ofm_notebooks/gau_v2cpf/` is an earlier run without the iteration cap.
+
 ## Citation
 
 If you find this repository or the ideas presented in our paper useful, please consider citing our paper.
