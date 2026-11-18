@@ -57,6 +57,7 @@ class TorchlbfgsInvParams(InvMethodParamsGeneric):
     t_min: float = 1e-5 # threshold to prevent inverting X_t with t < t_min
     init_method: str = 'Xt'
     max_iter: int = 50
+    record_steps: bool = False # record the residual after every outer step (costs one extra grad eval per step)
 
 @dataclass
 class ManualInvParams(InvMethodParamsGeneric):
@@ -230,7 +231,31 @@ def ofm_inverse_torchlbfgs(
         loss.backward()
         return loss
 
+    # per-step convergence diagnostics; their own time is measured and excluded from stats['time']
+    step_stats, step_n_iter, step_func_evals = [], [], []
+    t_diag = 0.
+
+    def record_step():
+        nonlocal t_diag
+        if Xt.is_cuda:
+            torch.cuda.synchronize()
+        t_rec = time.perf_counter()
+        # gradient at the current iterate (the optimizer's prev_flat_grad lags one iteration behind)
+        loss = (t * model(Y_inv)).sum() - (Xt * Y_inv).sum() + ((1. - t)/2. * Y_inv * Y_inv).sum()
+        g = torch.autograd.grad(loss, Y_inv)[0].detach()
+        g_norms = torch.norm(g.flatten(start_dim=1), p=2, dim=1)
+        # max |g| is what tolerance_grad is compared against, i.e. a criterion over the whole batch
+        step_stats.append(torch.stack([g.abs().max(), g_norms.max(), g_norms.mean()]))
+        opt_state = opt.state_dict()['state'].get(0, dict(n_iter=0, func_evals=0))
+        step_n_iter.append(opt_state['n_iter'])
+        step_func_evals.append(opt_state['func_evals'])
+        if Xt.is_cuda:
+            torch.cuda.synchronize()
+        t_diag += time.perf_counter() - t_rec
+
     if len(Xt) > 0:
+        if params.record_steps:
+            record_step() # residual at the initial point
         for i_step in range(params.max_iter):
             opt.step(closure)
 
@@ -239,12 +264,21 @@ def ofm_inverse_torchlbfgs(
             grads = grads.view_as(Xt)
             assert grads.shape == Xt.shape
             n_steps += 1
+            if params.record_steps:
+                record_step()
 
             if (state['n_iter'] == prev_n_iter) or (i_step == params.max_iter-1):
                 norms = torch.norm(grads.flatten(start_dim=1), p=2, dim=1)
                 break
             prev_n_iter = state['n_iter']
-    t_elaps = time.perf_counter() - t_strt
+    if params.record_steps and len(step_stats) > 0:
+        t_rec = time.perf_counter()
+        stats['step_stats'] = torch.stack(step_stats).cpu().numpy() # (n_steps + 1, 3): max|g|, max l2 norm, mean l2 norm
+        stats['step_n_iter'] = step_n_iter
+        stats['step_func_evals'] = step_func_evals
+        t_diag += time.perf_counter() - t_rec
+    t_elaps = time.perf_counter() - t_strt - t_diag
+    stats['time_diag'] = t_diag
     norms = FUNC_grad_norm(model, Y_inv, Xt, t).detach()
     stats['time'] = t_elaps
     if params.report_final_norms:
