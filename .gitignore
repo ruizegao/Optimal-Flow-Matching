@@ -139,3 +139,8 @@ ui-tests/.pnp.*
 # generated html
 notebook/templates/*.html
 .idea/
+
+# Local training output
+/cc_experiments/runs/
+/ofm_notebooks/gau_v2cpf*/**/*.pt
+/ofm_notebooks/gau_v2cpf*/**/*.pth

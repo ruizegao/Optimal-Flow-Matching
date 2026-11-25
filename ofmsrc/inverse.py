@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 from tqdm import tqdm
 from .icnn import GradNNGeneric
@@ -5,7 +6,7 @@ from IPython.display import clear_output
 import torch.nn.functional as F
 from .tools import freeze_context
 from typing import Optional, Dict, Type
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import time
 
 ###################
@@ -58,6 +59,9 @@ class TorchlbfgsInvParams(InvMethodParamsGeneric):
     init_method: str = 'Xt'
     max_iter: int = 50
     record_steps: bool = False # record the residual after every outer step (costs one extra grad eval per step)
+    initial_guess: Optional[torch.Tensor] = None  # one starting point per row of Xt
+    wolfe_retry_displacement: Optional[float] = None  # retry if any returned point is farther from Xt
+    report_solution: bool = False  # add the detached full-batch result to stats
 
 @dataclass
 class ManualInvParams(InvMethodParamsGeneric):
@@ -193,18 +197,23 @@ def ofm_inverse_torchlbfgs(
         Xt: torch.Tensor,
         t: torch.Tensor,
         params: TorchlbfgsInvParams,
-        stats: Dict = dict()
+        stats: Optional[Dict] = None,
 ):
-    assert t.size(0) == Xt.size(0)
-    assert len(t.shape) == 2
-    assert t.size(1) == 1
+    assert t.shape == (Xt.size(0), 1)
+    if stats is None:
+        stats = {}
+    if params.initial_guess is not None and params.initial_guess.shape != Xt.shape:
+        raise ValueError("initial_guess must have the same shape as Xt")
+    if params.wolfe_retry_displacement is not None and len(Xt):
+        return _inverse_with_wolfe_retry(model, Xt, t, params, stats)
 
-    # freeze(model)
     Y_inv_final = Xt.clone()
-    indices = t.squeeze() >= params.t_min
+    indices = t[:, 0] >= params.t_min
     Xt = Y_inv_final[indices]
     t = t[indices]
-    if params.init_method == 'Xt':
+    if params.initial_guess is not None:
+        Y_inv = params.initial_guess.detach().to(Xt)[indices]
+    elif params.init_method == 'Xt':
         Y_inv = Xt.clone()
     elif params.init_method == 'normal':
         Y_inv = torch.randn_like(Xt)
@@ -216,13 +225,22 @@ def ofm_inverse_torchlbfgs(
         raise Exception(f"Unknown init_method: '{params.init_method}'")
     Y_inv.requires_grad_(True)
 
-    # optimizer
-    opt = torch.optim.LBFGS([Y_inv], **params.lbfgs_params)
-    # opt = torch.optim.LBFGS([Y_inv], tolerance_grad=1e-4)
+    stats['n_eligible'] = len(Xt)
+    if not len(Xt):
+        stats.update(time=0., time_diag=0., steps=0, norms_max=0., norms_mean=0.,
+                     func_evals=0, inner_iterations=0)
+        if params.record_steps:
+            stats.update(step_stats=np.zeros((1, 3), dtype=np.float32),
+                         step_n_iter=[0], step_func_evals=[0])
+        if params.report_final_norms:
+            stats['norms'] = Xt.new_empty((0,))
+        if params.report_solution:
+            stats['solution'] = Y_inv_final.detach()
+        return Y_inv_final.detach()
 
+    opt = torch.optim.LBFGS([Y_inv], **params.lbfgs_params)
     t_strt = time.perf_counter()
     n_steps = 0
-    norms = torch.zeros(1)
     prev_n_iter = 0
 
     def closure():
@@ -253,25 +271,18 @@ def ofm_inverse_torchlbfgs(
             torch.cuda.synchronize()
         t_diag += time.perf_counter() - t_rec
 
-    if len(Xt) > 0:
+    if params.record_steps:
+        record_step()  # residual at the initial point
+    for _ in range(params.max_iter):
+        opt.step(closure)
+        n_iter = opt.state[Y_inv]['n_iter']
+        n_steps += 1
         if params.record_steps:
-            record_step() # residual at the initial point
-        for i_step in range(params.max_iter):
-            opt.step(closure)
-
-            state = opt.state_dict()['state'][0]
-            grads = state['prev_flat_grad']
-            grads = grads.view_as(Xt)
-            assert grads.shape == Xt.shape
-            n_steps += 1
-            if params.record_steps:
-                record_step()
-
-            if (state['n_iter'] == prev_n_iter) or (i_step == params.max_iter-1):
-                norms = torch.norm(grads.flatten(start_dim=1), p=2, dim=1)
-                break
-            prev_n_iter = state['n_iter']
-    if params.record_steps and len(step_stats) > 0:
+            record_step()
+        if n_iter == prev_n_iter:
+            break
+        prev_n_iter = n_iter
+    if params.record_steps:
         t_rec = time.perf_counter()
         stats['step_stats'] = torch.stack(step_stats).cpu().numpy() # (n_steps + 1, 3): max|g|, max l2 norm, mean l2 norm
         stats['step_n_iter'] = step_n_iter
@@ -286,6 +297,8 @@ def ofm_inverse_torchlbfgs(
     stats['norms_max'] = norms.max().item()
     stats['norms_mean'] = norms.mean().item()
     stats['steps'] = n_steps
+    stats['func_evals'] = opt.state[Y_inv].get('func_evals', 0)
+    stats['inner_iterations'] = opt.state[Y_inv].get('n_iter', 0)
     if params.verbose:
         print('--------------------------')
         print('Inverse TorchLBFGS summary')
@@ -297,7 +310,53 @@ def ofm_inverse_torchlbfgs(
         print(f'Time elapsed (s): {t_elaps}')
         print('--------------------------')
     Y_inv_final[indices] = Y_inv.detach()
+    if params.report_solution:
+        stats['solution'] = Y_inv_final.detach()
     return Y_inv_final.detach()
+
+
+def _inverse_with_wolfe_retry(model, Xt, t, params, stats):
+    """Try plain L-BFGS and restart the batch if its inverse points make an extreme excursion."""
+    started = time.perf_counter()
+    limit = params.wolfe_retry_displacement
+    if not 0. < limit < float('inf'):
+        raise ValueError("wolfe_retry_displacement must be positive and finite")
+    plain_params = replace(
+        params, wolfe_retry_displacement=None,
+        lbfgs_params={**params.lbfgs_params, 'line_search_fn': None},
+    )
+    plain_stats = {}
+    solution = ofm_inverse_torchlbfgs(model, Xt, t, plain_params, plain_stats)
+    displacement = (solution - Xt).norm(dim=1)
+    max_displacement = torch.where(displacement.isfinite(), displacement, torch.inf).max().item()
+    retry_stats = {}
+    retried = max_displacement > limit
+    if retried:
+        # The plain attempt shared one optimizer across the batch. Restart
+        # every row from Xt to discard its optimizer state and any bad warm start.
+        retry_params = replace(
+            plain_params, initial_guess=None, init_method='Xt',
+            lbfgs_params={**plain_params.lbfgs_params, 'line_search_fn': 'strong_wolfe'},
+        )
+        solution = ofm_inverse_torchlbfgs(model, Xt, t, retry_params, retry_stats)
+        if not solution.isfinite().all().item():
+            raise FloatingPointError("Strong Wolfe retry returned a non-finite inverse")
+
+    # The curve and residuals describe the returned solution. Keep separate
+    # counters to account for both attempts, including any discarded work.
+    stats.update(retry_stats if retried else plain_stats)
+    stats.update(
+        wolfe_retried=retried, plain_max_displacement=max_displacement,
+        plain_steps=plain_stats['steps'], wolfe_steps=retry_stats.get('steps', 0),
+        time_diag=plain_stats['time_diag'] + retry_stats.get('time_diag', 0.),
+    )
+    stats['plain_func_evals'] = plain_stats['func_evals']
+    stats['wolfe_func_evals'] = retry_stats.get('func_evals', 0)
+    stats['func_evals'] = stats['plain_func_evals'] + stats['wolfe_func_evals']
+    stats['inner_iterations'] = plain_stats['inner_iterations'] + retry_stats.get('inner_iterations', 0)
+    stats['time'] = time.perf_counter() - started - stats['time_diag']
+    return solution
+
 
 def ofm_inverse_torchoptim(
         model: GradNNGeneric,
@@ -395,8 +454,10 @@ def ofm_inverse(
         Xt: torch.Tensor,
         t: torch.Tensor,
         method_params: InvMethodParamsGeneric = TorchoptimInvParams(),
-        stats: Dict = dict()
+        stats: Optional[Dict] = None,
 ):
+    if stats is None:
+        stats = {}
     if len(t.shape) == 1:
         t = t.unsqueeze(1)
     assert t.size(0) == Xt.size(0)
