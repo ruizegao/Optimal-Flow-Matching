@@ -1,0 +1,1 @@
+source,method,seed,iteration,true_loss,previous_median,spike_ratio,in_summary,iteration_ms,inverse_steps,inverse_func_evals,inverse_max_residual,wolfe_retried

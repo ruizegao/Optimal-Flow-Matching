@@ -47,3 +47,13 @@ python cc_experiments/compare_results.py cc_experiments/results \
 ```
 
 Give `compare_results.py` the `cc_experiments/runs` directory to compare fresh runs. For a locally captured spike, `diagnose.py spike` takes the capture file and computes a float64 reference inverse on CPU. `diagnose.py evaluate` takes one or more local checkpoint files and evaluates them on a fixed held-out batch.
+
+## FFHQ adult-to-child results
+
+These runs compare inverse solvers on the 512-dimensional FFHQ latent codes
+used for the paper’s adult-to-child experiment. All nine profiles use seed 42.
+The comparison uses each run’s full logged history. Seven methods reached
+30,000 iterations. Nesterov logged 12,320 and `cap1000` logged 5,422.
+[Paper, Figure 7](https://arxiv.org/html/2403.13117#S4.F7)
+
+[Recorded profiles](ffhq_results/) · [Comparison figure](ffhq_results/comparison/comparison.png) · [Training curves](ffhq_results/comparison/training_curves.png) · [Run summary](ffhq_results/comparison/run_summary.csv)
