@@ -48,6 +48,10 @@ python cc_experiments/compare_results.py cc_experiments/results \
 
 Give `compare_results.py` the `cc_experiments/runs` directory to compare fresh runs. For a locally captured spike, `diagnose.py spike` takes the capture file and computes a float64 reference inverse on CPU. `diagnose.py evaluate` takes one or more local checkpoint files and evaluates them on a fixed held-out batch.
 
+The seed-42 `plain` run first captured a loss spike at iteration 16,468.
+The capture includes the model and Adam state before that batch’s update,
+along with the batch itself. [Pre-update plain L-BFGS capture](results/plain/seed_42/spikes/iter_016468.pt)
+
 ## FFHQ adult-to-child results
 
 These runs compare inverse solvers on the 512-dimensional FFHQ latent codes
@@ -57,8 +61,3 @@ The comparison uses each run’s full logged history. Seven methods reached
 [Paper, Figure 7](https://arxiv.org/html/2403.13117#S4.F7)
 
 [Recorded profiles](ffhq_results/) · [Comparison figure](ffhq_results/comparison/comparison.png) · [Training curves](ffhq_results/comparison/training_curves.png) · [Run summary](ffhq_results/comparison/run_summary.csv)
-
-The FFHQ Nesterov capture at iteration 12,320 contains the model, Adam state,
-random number generator state, and the batch that produced a non-finite
-inverse. The trainer saved it before applying that batch’s update.
-[Pre-update spike capture](ffhq_results/nesterov/seed_42/spikes/iter_012320.pt)
