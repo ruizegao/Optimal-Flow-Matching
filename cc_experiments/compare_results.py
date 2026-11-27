@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Compare cluster training profiles and save CSV tables and PNG figures.
 
-Pass a training output directory, individual run directories, or profile files.
-By default, search amortized_tests, cc_experiments/runs, then cc_experiments/results.
+Pass the OFM_OUTPUT directory from run.sh, individual run directories, or profile
+files. By default, search the repository's amortized_tests and cc_experiments/runs.
 """
 
 import argparse
@@ -27,6 +27,7 @@ METHODS = {
     "restricted": ("Restricted time", "#00818A"),
     "restricted-wolfe": ("Restricted + Wolfe", "#AC4269"),
     "cap1000": ("Plain cap 1,000", "#847332"),
+    "nesterov": ("Nesterov", "#C22D34"),
 }
 DESCRIPTIONS = {
     "plain": "Uses capped L-BFGS without a line search.",
@@ -37,11 +38,13 @@ DESCRIPTIONS = {
     "restricted": "Limits extreme t values and uses plain L-BFGS.",
     "restricted-wolfe": "Limits extreme t values and uses Strong Wolfe on every batch.",
     "cap1000": "Allows up to 1,000 outer steps of plain L-BFGS.",
+    "nesterov": "Accelerates each sample and checks its velocity error bound.",
 }
 NUMERIC_FIELDS = (
     "true_loss", "t_total", "t_inverse", "t_ihv", "t_amort", "inverse_steps",
     "inverse_func_evals", "inverse_max_residual", "inverse_max_displacement",
     "cap_hit", "wolfe_retried", "heldout_sliced_w2", "cuda_peak_reserved_mib",
+    "inverse_certified_fraction", "t_inverse_bound",
 )
 SPIKE_FIELDS = [
     "source", "method", "seed", "iteration", "true_loss", "previous_median",
@@ -61,10 +64,9 @@ class Run:
 def find_profiles(inputs):
     paths = set()
     if not inputs:
-        for directory in (DEFAULT_RESULTS, HERE / "runs", HERE / "results"):
-            paths.update(directory.rglob("profile.csv"))
-            if paths:
-                break
+        paths.update(DEFAULT_RESULTS.rglob("profile.csv"))
+        if not paths:
+            paths.update((HERE / "runs").rglob("profile.csv"))
     for path in inputs:
         if path.is_file():
             paths.add(path)
@@ -132,7 +134,6 @@ def common_iterations(runs, count):
 def tables(runs, shared, window):
     summaries, events = [], []
     for run in runs:
-        source = str(run.path.relative_to(HERE.parent) if run.path.is_relative_to(HERE.parent) else run.path)
         d = run.data
         cut = d if shared is None else d.loc[shared]
         evaluations = cut["heldout_sliced_w2"].dropna()
@@ -142,13 +143,15 @@ def tables(runs, shared, window):
         time = cut["t_total"].sum(min_count=len(cut))
         inv_time = cut["t_inverse"].sum(min_count=len(cut))
         summaries.append({
-            "source": source, "method": run.method, "seed": run.seed,
+            "source": str(run.path), "method": run.method, "seed": run.seed,
             "logged_iterations": len(d), "summarized_iterations": len(cut),
             "first_iteration": cut.index[0], "last_iteration": cut.index[-1],
             "training_seconds": time, "mean_iteration_ms": cut["t_total"].mean() * 1000,
             "p95_iteration_ms": cut["t_total"].quantile(.95) * 1000,
             "mean_inverse_ms": cut["t_inverse"].mean() * 1000,
             "inverse_time_share": inv_time / time if time > 0 else np.nan,
+            "mean_inverse_bound_ms": cut["t_inverse_bound"].mean() * 1000,
+            "mean_inverse_certified_fraction": cut["inverse_certified_fraction"].mean(),
             "mean_inverse_steps": cut["inverse_steps"].mean(),
             "mean_inverse_func_evals": cut["inverse_func_evals"].mean(),
             "p95_inverse_max_residual": cut["inverse_max_residual"].quantile(.95),
@@ -166,7 +169,7 @@ def tables(runs, shared, window):
         })
         for i, row in spikes.iterrows():
             events.append({
-                "source": source, "method": run.method, "seed": run.seed, "iteration": i,
+                "source": str(run.path), "method": run.method, "seed": run.seed, "iteration": i,
                 "true_loss": row["true_loss"], "previous_median": row["previous_median"],
                 "spike_ratio": row["spike_ratio"], "in_summary": shared is None or i in shared,
                 "iteration_ms": row["t_total"] * 1000, "inverse_steps": row["inverse_steps"],
@@ -193,13 +196,19 @@ def presentation(groups):
 
 
 def training_figure(groups, labels, colors, window, spike_factor, output):
-    fig, axes = plt.subplots(2, 2, figsize=(13, 7.5))
-    metrics = (
+    has_certificates = "nesterov" in groups
+    metrics = [
         ("true_loss", "True loss", 1., "median", True),
         ("t_total", "Iteration time (ms)", 1000., "mean", True),
-        ("inverse_steps", "L-BFGS outer steps", 1., "mean", False),
+        ("inverse_steps", "Inverse solver steps" if has_certificates else "L-BFGS outer steps", 1., "mean", False),
         ("inverse_max_residual", "Inverse max residual (rolling p95)", 1., "quantile", True),
-    )
+    ]
+    if has_certificates:
+        metrics.extend([
+            ("t_inverse", "Inner solve time (ms)", 1000., "mean", True),
+            ("inverse_certified_fraction", "Certified inverse samples (%)", 100., "mean", False),
+        ])
+    fig, axes = plt.subplots(len(metrics) // 2, 2, figsize=(13, 10.5 if has_certificates else 7.5))
     for ax, (key, title, scale, stat, log) in zip(axes.flat, metrics):
         finite_curves = []
         for group, runs in groups.items():
@@ -214,7 +223,7 @@ def training_figure(groups, labels, colors, window, spike_factor, output):
                 else:
                     curve = getattr(roll, stat)()
                 curves.append(curve)
-                if key == "true_loss":
+                if key in {"true_loss", "t_inverse"}:
                     spikes = stream[run.data["spike"] & (stream > 0)]
                     ax.scatter(spikes.index, spikes, c=[colors[group]], marker="x",
                                s=29, linewidths=1.2, zorder=4)
@@ -229,6 +238,8 @@ def training_figure(groups, labels, colors, window, spike_factor, output):
                     transform=ax.transAxes, color="#52646F")
         elif log:
             ax.set_yscale("log")
+        if key == "inverse_certified_fraction":
+            ax.set_ylim(0, 102)
         ax.set_title(title, loc="left", fontweight="bold")
         ax.set_xlabel("Training iteration")
         ax.grid(axis="y", alpha=.25)
@@ -237,8 +248,11 @@ def training_figure(groups, labels, colors, window, spike_factor, output):
     if names:
         fig.legend(handles, names, ncols=min(4, len(names)), loc="upper center",
                    bbox_to_anchor=(.5, .916), frameon=False, fontsize=10)
-    fig.text(.095, .037, f"Full logged histories. Lines show {window}-batch rolling summaries and the median across runs. "
-             f"Crosses mark losses ≥ {spike_factor:g}× the preceding median.", fontsize=9.2, color="#52646F")
+    caption = (f"Full logged histories. Lines show {window}-batch rolling summaries and the median across runs. "
+               f"Crosses mark losses ≥ {spike_factor:g}× the preceding median.")
+    if has_certificates:
+        caption += "\nL-BFGS uses outer steps per batch. The Nesterov curve uses mean steps per sample."
+    fig.text(.095, .037, caption, fontsize=9.2, color="#52646F")
     fig.subplots_adjust(left=.095, right=.97, bottom=.11, top=.80, wspace=.26, hspace=.36)
     fig.savefig(output, dpi=175, facecolor="white")
     plt.close(fig)

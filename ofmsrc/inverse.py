@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from .tools import freeze_context
 from typing import Optional, Dict, Type
 from dataclasses import dataclass, field, replace
+import math
 import time
 
 ###################
@@ -62,6 +63,24 @@ class TorchlbfgsInvParams(InvMethodParamsGeneric):
     initial_guess: Optional[torch.Tensor] = None  # one starting point per row of Xt
     wolfe_retry_displacement: Optional[float] = None  # retry if any returned point is farther from Xt
     report_solution: bool = False  # add the detached full-batch result to stats
+
+@dataclass(kw_only=True)
+class NesterovInvParams(InvMethodParamsGeneric):
+    psi_L: float
+    velocity_tol: float
+    max_iter: int
+    psi_m: float = 0.
+    record_steps: bool = False
+
+    def __post_init__(self):
+        if not 0. <= self.psi_m <= self.psi_L < math.inf:
+            raise ValueError("Require finite curvature bounds with 0 <= psi_m <= psi_L")
+        if not 0. < self.velocity_tol < math.inf or self.max_iter < 0:
+            raise ValueError("Require a positive finite velocity_tol and a nonnegative max_iter")
+
+    @property
+    def name(self):
+        return 'nesterov'
 
 @dataclass
 class ManualInvParams(InvMethodParamsGeneric):
@@ -434,19 +453,118 @@ def ofm_inverse_torchoptim(
     return Y_inv_final.detach()
 
 
+@torch.no_grad()
+def ofm_inverse_nesterov(
+        model: GradNNGeneric,
+        Xt: torch.Tensor,
+        t: torch.Tensor,
+        params: NesterovInvParams,
+        stats: Optional[Dict] = None,
+):
+    """Run one accelerated inverse per row and check the returned iterate."""
+    started = time.perf_counter()
+    assert t.shape == (Xt.size(0), 1)
+    Xt, t = Xt.detach(), t.detach()
+    mu = (1 - t) + t * params.psi_m
+    smoothness = (1 - t) + t * params.psi_L
+    if not ((t >= 0) & (t <= 1) & (mu > 0) & smoothness.isfinite()).all().item():
+        raise ValueError("Nesterov requires 0 <= t <= 1 and finite, positive interpolated curvature. "
+                         "Use a positive psi_m for t=1.")
+    sqrt_l, sqrt_mu = smoothness.sqrt(), mu.sqrt()
+    momentum = (sqrt_l - sqrt_mu) / (sqrt_l + sqrt_mu)
+    z = Xt.clone()
+    previous = z.clone()
+    active = torch.where(t[:, 0] > 0)[0]
+    eligible = len(active)
+    steps = torch.zeros(len(t), dtype=torch.long, device=t.device)
+    norms = Xt.new_zeros(len(t))
+    bounds = Xt.new_zeros(len(t))
+    max_abs = torch.zeros_like(norms) if params.record_steps else None
+    history, eval_history = [], []
+    func_evals = gradient_samples = rounds = 0
+
+    def residual(point, rows, *, divide_by_time=False):
+        nonlocal func_evals, gradient_samples
+        func_evals += 1
+        gradient_samples += len(point)
+        with torch.enable_grad():
+            grad_psi = model.push_nograd(point.detach())
+        time_rows = t[rows]
+        target = Xt[rows]
+        shift = grad_psi - point
+        # Group the two terms around the closer endpoint to avoid cancellation.
+        late = (grad_psi - target) - (1 - time_rows) * shift
+        if divide_by_time:
+            return torch.where(time_rows < .5, (point - target) / time_rows + shift,
+                               late / time_rows)
+        return torch.where(time_rows < .5, (point - target) + time_rows * shift, late)
+
+    for k in range(params.max_iter + 1):
+        if not len(active):
+            break
+        current = z[active]
+        # Evaluate r/(t*mu) before taking the norm to retain accuracy at small t.
+        scaled_residual = residual(current, active, divide_by_time=True)
+        r = scaled_residual * t[active]
+        bound = torch.linalg.vector_norm(scaled_residual / mu[active], dim=1)
+        norms[active] = torch.linalg.vector_norm(r, dim=1)
+        bounds[active] = bound
+        if max_abs is not None:
+            max_abs[active] = r.abs().amax(dim=1)
+            history.append(torch.stack((max_abs.max(), norms.max(), norms.mean())))
+            eval_history.append(func_evals)
+        unfinished = ~(bound <= params.velocity_tol)
+        active = active[unfinished]
+        if not len(active) or k == params.max_iter:
+            break
+
+        current = current[unfinished]
+        lookahead = current + momentum[active] * (current - previous[active])
+        previous[active] = current
+        # The first lookahead equals the current iterate, so reuse its residual.
+        direction = r[unfinished] if k == 0 else residual(lookahead, active)
+        z[active] = lookahead - direction / smoothness[active]
+        steps[active] += 1
+        rounds += 1
+
+    if stats is not None:
+        # t=0 gives the exact inverse without a gradient evaluation.
+        stats.update(
+            n_eligible=eligible, steps=steps.float().mean().item() if len(t) else 0.,
+            inner_iterations=rounds, func_evals=func_evals, gradient_samples=gradient_samples,
+            converged=1. - len(active) / len(t) if len(t) else 1., cap_hit=bool(len(active)),
+            norms_max=norms.max().item() if len(t) else 0.,
+            norms_mean=norms.mean().item() if len(t) else 0.,
+            velocity_bound_max=bounds.max().item() if len(t) else 0.,
+            psi_L=params.psi_L,
+        )
+        if params.report_final_norms:
+            certified = torch.ones_like(steps, dtype=torch.bool)
+            certified[active] = False
+            stats.update(norms=norms, sample_steps=steps, certified=certified)
+        if params.record_steps:
+            stats.update(step_stats=torch.stack(history or [Xt.new_zeros(3)]).cpu().numpy(),
+                         step_n_iter=list(range(len(history) or 1)),
+                         step_func_evals=eval_history or [0])
+        stats['time'] = time.perf_counter() - started
+    return z.detach()
+
+
 ################
 # main function
 
 INV_METHODS2SOLVERS = {
     'torchoptim': ofm_inverse_torchoptim,
     'torchlbfgs': ofm_inverse_torchlbfgs,
-    'manual': ofm_inverse_manual
+    'manual': ofm_inverse_manual,
+    'nesterov': ofm_inverse_nesterov,
 }
 
 INV_METHODS2PARAMCLASS = {
     'torchoptim': TorchoptimInvParams,
     'torchlbfgs': TorchlbfgsInvParams,
-    'manual': ManualInvParams
+    'manual': ManualInvParams,
+    'nesterov': NesterovInvParams,
 }
 
 def ofm_inverse(

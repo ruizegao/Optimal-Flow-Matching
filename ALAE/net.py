@@ -208,12 +208,9 @@ class DecodeBlock(nn.Module):
             x = self.blur(x)
 
         if noise:
-            if noise == 'batch_constant':
-                x = torch.addcmul(x, value=1.0, tensor1=self.noise_weight_1,
-                                  tensor2=torch.randn([1, 1, x.shape[2], x.shape[3]]))
-            else:
-                x = torch.addcmul(x, value=1.0, tensor1=self.noise_weight_1,
-                                  tensor2=torch.randn([x.shape[0], 1, x.shape[2], x.shape[3]]))
+            noise_batch = 1 if noise == 'batch_constant' else x.size(0)
+            noise_map = torch.randn((noise_batch, 1, *x.shape[-2:]), device=x.device, dtype=x.dtype)
+            x = torch.addcmul(x, self.noise_weight_1, noise_map)
         else:
             s = math.pow(self.layer + 1, 0.5)
             x = x + s * torch.exp(-x * x / (2.0 * s * s)) / math.sqrt(2 * math.pi) * 0.8
@@ -228,12 +225,8 @@ class DecodeBlock(nn.Module):
         x = self.conv_2(x)
 
         if noise:
-            if noise == 'batch_constant':
-                x = torch.addcmul(x, value=1.0, tensor1=self.noise_weight_2,
-                                  tensor2=torch.randn([1, 1, x.shape[2], x.shape[3]]))
-            else:
-                x = torch.addcmul(x, value=1.0, tensor1=self.noise_weight_2,
-                                  tensor2=torch.randn([x.shape[0], 1, x.shape[2], x.shape[3]]))
+            noise_map = torch.randn((noise_batch, 1, *x.shape[-2:]), device=x.device, dtype=x.dtype)
+            x = torch.addcmul(x, self.noise_weight_2, noise_map)
         else:
             s = math.pow(self.layer + 1, 0.5)
             x = x + s * torch.exp(-x * x / (2.0 * s * s)) / math.sqrt(2 * math.pi) * 0.8

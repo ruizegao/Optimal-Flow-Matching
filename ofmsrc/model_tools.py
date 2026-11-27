@@ -11,7 +11,8 @@ from .inverse import (
 from .inverse import (
     InvMethodParamsGeneric,
     TorchoptimInvParams,
-    TorchlbfgsInvParams
+    TorchlbfgsInvParams,
+    NesterovInvParams,
 )
 from .ihv import ofm_ihv
 from .ihv import (
