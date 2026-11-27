@@ -57,3 +57,8 @@ The comparison uses each run’s full logged history. Seven methods reached
 [Paper, Figure 7](https://arxiv.org/html/2403.13117#S4.F7)
 
 [Recorded profiles](ffhq_results/) · [Comparison figure](ffhq_results/comparison/comparison.png) · [Training curves](ffhq_results/comparison/training_curves.png) · [Run summary](ffhq_results/comparison/run_summary.csv)
+
+The FFHQ Nesterov capture at iteration 12,320 contains the model, Adam state,
+random number generator state, and the batch that produced a non-finite
+inverse. The trainer saved it before applying that batch’s update.
+[Pre-update spike capture](ffhq_results/nesterov/seed_42/spikes/iter_012320.pt)
